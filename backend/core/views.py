@@ -1,4 +1,3 @@
-
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
@@ -6,9 +5,12 @@ load_dotenv()
 from .utils import CsrfExemptAPIView
 from .firebase_config import verify_firebase_token
 from rest_framework.views import APIView
-from rest_framework.generics import ListAPIView, RetrieveAPIView
-from .models import ReadingTest, ReadingQuestion, AnswerKey
-from .serializers import ReadingTestListSerializer, ReadingTestDetailSerializer
+from rest_framework.generics import ListAPIView, RetrieveAPIView, RetrieveUpdateDestroyAPIView
+from .models import ReadingTest, ReadingQuestion, AnswerKey, ReadingTestSession, AnswerOption, ReadingPassage
+from .serializers import (
+    ReadingTestListSerializer, ReadingTestDetailSerializer, EssaySerializer, WritingPromptSerializer,
+    ReadingTestSessionSerializer, ReadingPassageSerializer, ReadingTestCreateSerializer, ReadingQuestionSerializer, ReadingQuestionUpdateSerializer, ReadingTestSessionResultSerializer
+)
 from .models import WritingTestSession
 from rest_framework import serializers
 from rest_framework import viewsets
@@ -24,6 +26,8 @@ import re
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
+from django.utils import timezone
+import json
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -57,12 +61,28 @@ class FirebaseLoginView(APIView):
 
 
 class EssaySubmissionView(CsrfExemptAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
         serializer = EssaySerializer(data=request.data)
         if serializer.is_valid():
-            essay = serializer.save(user=request.user)
+            essay = serializer.save(user=user)
 
             prompt = f"""
                         You are an IELTS examiner. Evaluate the following essay using 4 IELTS Writing criteria.  
@@ -118,9 +138,27 @@ class EssaySubmissionView(CsrfExemptAPIView):
 
 class AdminEssayListView(ListAPIView):
     serializer_class = EssaySerializer
-    permission_classes = [IsAuthenticated, IsAdmin]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Essay.objects.none()
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Essay.objects.none()
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return Essay.objects.none()
+        except User.DoesNotExist:
+            return Essay.objects.none()
+
         queryset = Essay.objects.select_related('user').order_by('-submitted_at')
         student_id = self.request.query_params.get('student_id')
         if student_id:
@@ -180,74 +218,203 @@ class EssayDetailView(RetrieveAPIView):
             return Essay.objects.none()
 
 class ReadingTestListView(ListAPIView):
-    queryset = ReadingTest.objects.all()
     serializer_class = ReadingTestListSerializer
+    permission_classes = [AllowAny]
 
+    def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if auth_header.startswith('Bearer '):
+            id_token = auth_header.split(' ')[1]
+            decoded = verify_firebase_token(id_token)
+            if decoded:
+                uid = decoded['uid']
+                try:
+                    user = User.objects.get(uid=uid)
+                    if user.role == 'admin':
+                        return ReadingTest.objects.all()
+                except User.DoesNotExist:
+                    pass
+        return ReadingTest.objects.filter(is_active=True)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
 
 class ReadingTestDetailView(RetrieveAPIView):
-    queryset = ReadingTest.objects.all()
     serializer_class = ReadingTestDetailSerializer
+    permission_classes = [AllowAny]
+    queryset = ReadingTest.objects.all()
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
 
-class ReadingTestSubmitView(APIView):
-    """
-    Ожидает:
-    {
-        "answers": {
-            "12": "A",
-            "13": "TRUE",
-            ...
-        }
-    }
-    """
+class StartReadingTestView(APIView):
+    permission_classes = [AllowAny]
+
     def post(self, request, pk):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
         try:
             test = ReadingTest.objects.get(pk=pk)
         except ReadingTest.DoesNotExist:
             return Response({"error": "Test not found"}, status=404)
 
-        answers = request.data.get("answers", {})
-        total = 0
-        correct = 0
+        # Check if user has an incomplete session
+        existing_session = ReadingTestSession.objects.filter(
+            user=user,
+            test=test,
+            completed=False
+        ).first()
 
-        for q in test.questions.all():
-            total += 1
-            user_answer = answers.get(str(q.id), "").strip().upper()
-            try:
-                correct_answer = AnswerKey.objects.get(question=q).correct_answer.strip().upper()
-                if user_answer == correct_answer:
-                    correct += 1
-            except AnswerKey.DoesNotExist:
-                continue
+        from .serializers import ReadingTestDetailSerializer
+        test_data = ReadingTestDetailSerializer(test).data
 
-        score = round((correct / total) * 40)
-        band_score = self.convert_to_band(score)
+        if existing_session:
+            return Response({
+                "session_id": existing_session.id,
+                "test": test_data,
+                "message": "Resuming existing session"
+            })
+
+        # Create new session
+        session = ReadingTestSession.objects.create(
+            user=user,
+            test=test
+        )
 
         return Response({
-            "total_questions": total,
-            "correct_answers": correct,
-            "raw_score": score,
-            "band_score": band_score
+            "session_id": session.id,
+            "test": test_data,
+            "message": "New session started"
         })
 
-    def convert_to_band(self, raw_score):
-        if raw_score >= 39: return 9.0
-        if raw_score >= 37: return 8.5
-        if raw_score >= 35: return 8.0
-        if raw_score >= 33: return 7.5
-        if raw_score >= 30: return 7.0
-        if raw_score >= 27: return 6.5
-        if raw_score >= 23: return 6.0
-        if raw_score >= 19: return 5.5
-        if raw_score >= 15: return 5.0
-        if raw_score >= 12: return 4.5
-        return 4.0
+class SubmitReadingTestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, session_id):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
+        try:
+            session = ReadingTestSession.objects.get(id=session_id, user=user)
+        except ReadingTestSession.DoesNotExist:
+            # Если сессия не найдена, создаем новую (например, если студент перезагрузил страницу)
+            test_id = request.data.get("test_id")
+            if not test_id:
+                return Response({"error": "Test ID not provided"}, status=400)
+            test = ReadingTest.objects.get(pk=test_id)
+            session = ReadingTestSession.objects.create(user=user, test=test, completed=False)
+        
+        # Обновляем сессию (всегда)
+        session.answers = request.data.get("answers", {})
+        session.completed = True
+        session.completed_at = timezone.now()
+        session.time_taken = request.data.get("time_taken")
+        session.calculate_score()
+        session.save()
+        return Response({ "message": "Test submitted successfully", "band_score": session.band_score, "raw_score": session.raw_score, "time_taken": session.time_taken })
+
+class ReadingTestSessionListView(ListAPIView):
+    serializer_class = ReadingTestSessionSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return ReadingTestSession.objects.none()
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return ReadingTestSession.objects.none()
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            return ReadingTestSession.objects.filter(
+                user=user,
+                completed=True
+            ).select_related('test')
+        except User.DoesNotExist:
+            return ReadingTestSession.objects.none()
+
+class ReadingTestSessionDetailView(RetrieveAPIView):
+    serializer_class = ReadingTestSessionResultSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return ReadingTestSession.objects.none()
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return ReadingTestSession.objects.none()
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            return ReadingTestSession.objects.filter(
+                user=user
+            ).select_related('test')
+        except User.DoesNotExist:
+            return ReadingTestSession.objects.none()
 
 class StartWritingSessionView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
-        session = WritingTestSession.objects.create(user=request.user)
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
+        session = WritingTestSession.objects.create(user=user)
         task1_prompt = WritingPrompt.objects.filter(task_type="task1").order_by("?").first()
         task2_prompt = WritingPrompt.objects.filter(task_type="task2").order_by("?").first()
 
@@ -261,59 +428,44 @@ class StartWritingSessionView(APIView):
 
 
 class SubmitTaskView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
-        session_id = request.data.get("session_id")
-        task_type = request.data.get("task_type")
-        submitted_text = request.data.get("submitted_text")
-        question_text = request.data.get("question_text")
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
 
-        if not all([session_id, task_type, submitted_text, question_text]):
-            return Response({'error': 'Missing data'}, status=400)
+        serializer = EssaySerializer(data=request.data)
+        if serializer.is_valid():
+            essay = serializer.save(user=user)
 
-        session = WritingTestSession.objects.get(id=session_id, user=request.user)
-
-        existing = Essay.objects.filter(user=request.user, test_session=session, task_type=task_type).first()
-        if existing:
-            return Response({'error': f'{task_type} already submitted'}, status=400)
-
-        Essay.objects.create(
-            user=request.user,
-            task_type=task_type,
-            submitted_text=submitted_text,
-            question_text=question_text,
-            test_session=session
-        )
-        return Response({'message': f'{task_type} saved'})
-
-
-class FinishWritingSessionView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-        session_id = request.data.get("session_id")
-        session = WritingTestSession.objects.get(id=session_id, user=request.user)
-        essays = session.essay_set.all()
-
-        if essays.count() < 2:
-            return Response({'error': 'Both Task 1 and Task 2 are required'}, status=400)
-
-        for essay in essays:
             prompt = f"""
-You are an IELTS examiner. Evaluate the following essay using 4 IELTS criteria (0–9):
-1. Task Response
-2. Coherence and Cohesion
-3. Lexical Resource
-4. Grammatical Range and Accuracy
+                        You are an IELTS examiner. Evaluate the following essay using 4 IELTS Writing criteria.  
+                        Score each from 0 to 9 and return the result in plain text format like:
+                        
+                        Task Response: 8.5
+                        Coherence and Cohesion: 8
+                        Lexical Resource: 8
+                        Grammatical Range and Accuracy: 9
+                        
+                        Feedback: <full feedback here>
+                        
+                        Essay:
+                        {essay.submitted_text}
+                        """
 
-Return each criterion in the format:
-Task Response: 8.5
-...
-
-Essay:
-{essay.submitted_text}
-"""
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -347,13 +499,64 @@ Essay:
             essay.feedback = content
             essay.save()
 
-        session.completed = True
-        session.band_score = round_ielts_band(
-            sum(e.overall_band for e in essays) / essays.count()
-        )
-        session.save()
+            return Response(EssaySerializer(essay).data)
 
-        return Response({'message': 'AI feedback saved for both tasks'})
+        return Response(serializer.errors, status=400)
+
+
+class FinishWritingSessionView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
+        session_id = request.data.get("session_id")
+        if not session_id:
+            return Response({'error': 'Session ID required'}, status=400)
+
+        try:
+            session = WritingTestSession.objects.get(id=session_id, user=user)
+        except WritingTestSession.DoesNotExist:
+            return Response({'error': 'Session not found'}, status=404)
+
+        essays = Essay.objects.filter(user=user, test_session=session)
+        if not essays.exists():
+            return Response({'error': 'No essays found for this session'}, status=400)
+
+        # Calculate overall band score
+        total_score = 0
+        essay_count = 0
+        
+        for essay in essays:
+            if essay.overall_band:
+                total_score += essay.overall_band
+                essay_count += 1
+
+        if essay_count > 0:
+            overall_band = total_score / essay_count
+        else:
+            overall_band = 0
+
+        return Response({
+            'session_id': session.id,
+            'overall_band': round(overall_band, 1),
+            'essays_count': essay_count,
+            'message': 'Session completed successfully'
+        })
 
 
 class WritingPromptSerializer(serializers.ModelSerializer):
@@ -366,33 +569,190 @@ class WritingPromptSerializer(serializers.ModelSerializer):
 class WritingPromptViewSet(viewsets.ModelViewSet):
     queryset = WritingPrompt.objects.all().order_by('-created_at')
     serializer_class = WritingPromptSerializer
-    permission_classes = [IsAuthenticated, IsAdmin]
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return WritingPrompt.objects.none()
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return WritingPrompt.objects.none()
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return WritingPrompt.objects.none()
+        except User.DoesNotExist:
+            return WritingPrompt.objects.none()
+
+        return WritingPrompt.objects.all().order_by('-created_at')
 
     @action(detail=False, methods=['get'], url_path='active', permission_classes=[AllowAny])
     def get_active_prompt(self, request):
-        task_type = request.query_params.get('task_type')
-        if not task_type:
-            return Response({"error": "task_type required"}, status=400)
-
+        task_type = request.query_params.get('task_type', 'task1')
         prompt = WritingPrompt.objects.filter(task_type=task_type, is_active=True).first()
-        if not prompt:
-            return Response({"error": "No active prompt found"}, status=404)
-        return Response(WritingPromptSerializer(prompt).data)
+        if prompt:
+            return Response(WritingPromptSerializer(prompt).data)
+        return Response({'error': 'No active prompt found'}, status=404)
 
     def update(self, request, *args, **kwargs):
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return Response({'error': 'Admin access required'}, status=403)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
 
-        updated_prompt = serializer.save()
+        return super().update(request, *args, **kwargs)
 
-        if updated_prompt.is_active:
-            WritingPrompt.objects.filter(
-                task_type=updated_prompt.task_type,
-                is_active=True
-            ).exclude(pk=updated_prompt.pk).update(is_active=False)
+class ReadingTestCreateView(APIView):
+    permission_classes = [AllowAny]  # Временно разрешаем всем для отладки
 
-        return Response(WritingPromptSerializer(updated_prompt).data)
+    def post(self, request):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return Response({'error': 'Admin access required'}, status=403)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
+        data = request.data.copy()
+        # Парсим вопросы из JSON
+        questions_json = data.get('questions')
+        if questions_json:
+            if isinstance(questions_json, str):
+                questions = json.loads(questions_json)
+            else:
+                questions = questions_json
+        else:
+            questions = []
+        
+        # Подменяем image на файл из request.FILES
+        for idx, q in enumerate(questions):
+            image_field = f'question_image_{idx}'
+            if image_field in request.FILES:
+                q['image'] = request.FILES[image_field]
+        
+        # Собираем словарь для сериализатора
+        test_data = {
+            'title': data['title'],
+            'description': data.get('description', ''),
+            'passage': data['passage'],
+            'questions': questions
+        }
+        
+        serializer = ReadingTestCreateSerializer(data=test_data)
+        if serializer.is_valid():
+            test = serializer.save()
+            return Response({'id': test.id, 'message': 'Test created successfully'}, status=201)
+        return Response(serializer.errors, status=400)
+
+class ActivateReadingTestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, pk):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return Response({'error': 'Authentication required'}, status=401)
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return Response({'error': 'Invalid token'}, status=401)
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return Response({'error': 'Admin access required'}, status=403)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=401)
+
+        ReadingTest.objects.all().update(is_active=False)
+        test = ReadingTest.objects.get(pk=pk)
+        test.is_active = True
+        test.save()
+        return Response({'message': 'Test activated', 'id': test.id})
+
+class ReadingTestUpdateDeleteView(RetrieveUpdateDestroyAPIView):
+    queryset = ReadingTest.objects.all()
+    serializer_class = ReadingTestCreateSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return ReadingTest.objects.none()
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return ReadingTest.objects.none()
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return ReadingTest.objects.none()
+        except User.DoesNotExist:
+            return ReadingTest.objects.none()
+
+        return ReadingTest.objects.all()
+
+class ReadingQuestionUpdateDeleteView(RetrieveUpdateDestroyAPIView):
+    queryset = ReadingQuestion.objects.all()
+    serializer_class = ReadingQuestionUpdateSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        # Проверяем аутентификацию через Firebase token
+        auth_header = self.request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return ReadingQuestion.objects.none()
+        
+        id_token = auth_header.split(' ')[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            return ReadingQuestion.objects.none()
+        
+        uid = decoded['uid']
+        try:
+            user = User.objects.get(uid=uid)
+            if user.role != 'admin':
+                return ReadingQuestion.objects.none()
+        except User.DoesNotExist:
+            return ReadingQuestion.objects.none()
+
+        return ReadingQuestion.objects.all()
 
 
 
